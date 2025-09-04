@@ -19,6 +19,7 @@ import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
 import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { Database } from "./database";
+import { IVpc, ISubnet, SecurityGroup, Port, Peer, SubnetType } from "aws-cdk-lib/aws-ec2";
 
 export interface EmbeddingProps {
   readonly database: Database;
@@ -26,10 +27,14 @@ export interface EmbeddingProps {
   readonly documentBucket: IBucket;
   readonly bedrockCustomBotProject: codebuild.IProject;
   readonly enableRagReplicas: boolean;
+  // VPC configuration for private deployment
+  readonly vpc?: IVpc;
+  readonly vpcEndpointSecurityGroup?: SecurityGroup;
 }
 
 export class Embedding extends Construct {
   readonly removalHandler: IFunction;
+  readonly lambdaSecurityGroup?: SecurityGroup;
   private _updateSyncStatusHandler: IFunction;
   private _fetchStackOutputHandler: IFunction;
   private _StoreKnowledgeBaseIdHandler: IFunction;
@@ -40,6 +45,31 @@ export class Embedding extends Construct {
 
   constructor(scope: Construct, id: string, props: EmbeddingProps) {
     super(scope, id);
+
+    // Create security group for Lambda functions when VPC is enabled
+    if (props.vpc) {
+      this.lambdaSecurityGroup = new SecurityGroup(this, "EmbeddingLambdaSecurityGroup", {
+        vpc: props.vpc,
+        description: "Security group for Embedding Lambda functions in private VPC",
+        allowAllOutbound: false,
+      });
+
+      // Allow outbound HTTPS to VPC endpoints
+      this.lambdaSecurityGroup.addEgressRule(
+        Peer.ipv4(props.vpc.vpcCidrBlock),
+        Port.tcp(443),
+        "Allow HTTPS to VPC endpoints"
+      );
+
+      // Allow outbound HTTPS to VPC endpoint security group if provided
+      if (props.vpcEndpointSecurityGroup) {
+        this.lambdaSecurityGroup.addEgressRule(
+          props.vpcEndpointSecurityGroup,
+          Port.tcp(443),
+          "Allow HTTPS to VPC endpoints"
+        );
+      }
+    }
 
     this.setupStateMachineHandlers(props)
       .setupStateMachine(props)
@@ -88,6 +118,31 @@ export class Embedding extends Construct {
       })
     );
 
+    // Add VPC endpoint permissions when VPC is enabled
+    if (props.vpc) {
+      handlerRole.addManagedPolicy(
+        iam.ManagedPolicy.fromAwsManagedPolicyName(
+          "service-role/AWSLambdaVPCAccessExecutionRole"
+        )
+      );
+    }
+
+    // Prepare environment variables with VPC endpoint URLs if in private VPC mode
+    const baseEnvironment: { [key: string]: string } = {
+      ACCOUNT: Stack.of(this).account,
+      REGION: Stack.of(this).region,
+      CONVERSATION_TABLE_NAME: props.database.conversationTable.tableName,
+      BOT_TABLE_NAME: props.database.botTable.tableName,
+      TABLE_ACCESS_ROLE_ARN: props.database.tableAccessRole.roleArn,
+    };
+
+    // Add VPC-specific environment variables when in private VPC mode
+    if (props.vpc) {
+      baseEnvironment.VPC_ENABLED = "true";
+      baseEnvironment.DYNAMODB_ENDPOINT_URL = `https://dynamodb.${Stack.of(this).region}.amazonaws.com`;
+      baseEnvironment.STS_ENDPOINT_URL = `https://sts.${Stack.of(this).region}.amazonaws.com`;
+    }
+
     this._updateSyncStatusHandler = new DockerImageFunction(
       this,
       "UpdateSyncStatusHandler",
@@ -105,17 +160,29 @@ export class Embedding extends Construct {
         ),
         memorySize: 512,
         timeout: Duration.minutes(1),
-        environment: {
-          ACCOUNT: Stack.of(this).account,
-          REGION: Stack.of(this).region,
-          CONVERSATION_TABLE_NAME: props.database.conversationTable.tableName,
-          BOT_TABLE_NAME: props.database.botTable.tableName,
-          TABLE_ACCESS_ROLE_ARN: props.database.tableAccessRole.roleArn,
-        },
+        environment: baseEnvironment,
         role: handlerRole,
         logRetention: logs.RetentionDays.THREE_MONTHS,
+        // VPC configuration when private VPC is enabled
+        ...(props.vpc && this.lambdaSecurityGroup
+          ? {
+              vpc: props.vpc,
+              vpcSubnets: { subnetType: SubnetType.PRIVATE_ISOLATED },
+              securityGroups: [this.lambdaSecurityGroup],
+            }
+          : {}),
       }
     );
+
+    const fetchStackEnvironment: { [key: string]: string } = {
+      BEDROCK_REGION: props.bedrockRegion,
+    };
+
+    // Add VPC-specific environment variables when in private VPC mode
+    if (props.vpc) {
+      fetchStackEnvironment.VPC_ENABLED = "true";
+      fetchStackEnvironment.CLOUDFORMATION_ENDPOINT_URL = `https://cloudformation.${Stack.of(this).region}.amazonaws.com`;
+    }
 
     this._fetchStackOutputHandler = new DockerImageFunction(
       this,
@@ -135,10 +202,16 @@ export class Embedding extends Construct {
         memorySize: 512,
         timeout: Duration.minutes(1),
         role: handlerRole,
-        environment: {
-          BEDROCK_REGION: props.bedrockRegion,
-        },
+        environment: fetchStackEnvironment,
         logRetention: logs.RetentionDays.THREE_MONTHS,
+        // VPC configuration when private VPC is enabled
+        ...(props.vpc && this.lambdaSecurityGroup
+          ? {
+              vpc: props.vpc,
+              vpcSubnets: { subnetType: SubnetType.PRIVATE_ISOLATED },
+              securityGroups: [this.lambdaSecurityGroup],
+            }
+          : {}),
       }
     );
     this._StoreKnowledgeBaseIdHandler = new DockerImageFunction(
@@ -158,15 +231,17 @@ export class Embedding extends Construct {
         ),
         memorySize: 512,
         timeout: Duration.minutes(1),
-        environment: {
-          ACCOUNT: Stack.of(this).account,
-          REGION: Stack.of(this).region,
-          CONVERSATION_TABLE_NAME: props.database.conversationTable.tableName,
-          BOT_TABLE_NAME: props.database.botTable.tableName,
-          TABLE_ACCESS_ROLE_ARN: props.database.tableAccessRole.roleArn,
-        },
+        environment: baseEnvironment,
         role: handlerRole,
         logRetention: logs.RetentionDays.THREE_MONTHS,
+        // VPC configuration when private VPC is enabled
+        ...(props.vpc && this.lambdaSecurityGroup
+          ? {
+              vpc: props.vpc,
+              vpcSubnets: { subnetType: SubnetType.PRIVATE_ISOLATED },
+              securityGroups: [this.lambdaSecurityGroup],
+            }
+          : {}),
       }
     );
     this._StoreGuardrailArnHandler = new DockerImageFunction(
@@ -186,15 +261,17 @@ export class Embedding extends Construct {
         ),
         memorySize: 512,
         timeout: Duration.minutes(1),
-        environment: {
-          ACCOUNT: Stack.of(this).account,
-          REGION: Stack.of(this).region,
-          CONVERSATION_TABLE_NAME: props.database.conversationTable.tableName,
-          BOT_TABLE_NAME: props.database.botTable.tableName,
-          TABLE_ACCESS_ROLE_ARN: props.database.tableAccessRole.roleArn,
-        },
+        environment: baseEnvironment,
         role: handlerRole,
         logRetention: logs.RetentionDays.THREE_MONTHS,
+        // VPC configuration when private VPC is enabled
+        ...(props.vpc && this.lambdaSecurityGroup
+          ? {
+              vpc: props.vpc,
+              vpcSubnets: { subnetType: SubnetType.PRIVATE_ISOLATED },
+              securityGroups: [this.lambdaSecurityGroup],
+            }
+          : {}),
       }
     );
     return this;
@@ -564,6 +641,15 @@ export class Embedding extends Construct {
         resources: ["arn:aws:logs:*:*:*"],
       })
     );
+
+    // Add VPC endpoint permissions when VPC is enabled
+    if (props.vpc) {
+      removeHandlerRole.addManagedPolicy(
+        iam.ManagedPolicy.fromAwsManagedPolicyName(
+          "service-role/AWSLambdaVPCAccessExecutionRole"
+        )
+      );
+    }
     removeHandlerRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ["secretsmanager:DeleteSecret"],
@@ -577,6 +663,26 @@ export class Embedding extends Construct {
     props.database.botTable.grantStreamRead(removeHandlerRole);
     props.documentBucket.grantReadWrite(removeHandlerRole);
 
+    const removalEnvironment: { [key: string]: string } = {
+      ACCOUNT: Stack.of(this).account,
+      REGION: Stack.of(this).region,
+      BEDROCK_REGION: props.bedrockRegion,
+      CONVERSATION_TABLE_NAME: props.database.conversationTable.tableName,
+      BOT_TABLE_NAME: props.database.botTable.tableName,
+      TABLE_ACCESS_ROLE_ARN: props.database.tableAccessRole.roleArn,
+      DOCUMENT_BUCKET: props.documentBucket.bucketName,
+    };
+
+    // Add VPC-specific environment variables when in private VPC mode
+    if (props.vpc) {
+      removalEnvironment.VPC_ENABLED = "true";
+      removalEnvironment.DYNAMODB_ENDPOINT_URL = `https://dynamodb.${Stack.of(this).region}.amazonaws.com`;
+      removalEnvironment.S3_ENDPOINT_URL = `https://s3.${Stack.of(this).region}.amazonaws.com`;
+      removalEnvironment.CLOUDFORMATION_ENDPOINT_URL = `https://cloudformation.${Stack.of(this).region}.amazonaws.com`;
+      removalEnvironment.APIGATEWAY_ENDPOINT_URL = `https://execute-api.${Stack.of(this).region}.amazonaws.com`;
+      removalEnvironment.SECRETSMANAGER_ENDPOINT_URL = `https://secretsmanager.${Stack.of(this).region}.amazonaws.com`;
+    }
+
     this._removalHandler = new DockerImageFunction(this, "BotRemovalHandler", {
       code: DockerImageCode.fromImageAsset(
         path.join(__dirname, "../../../backend"),
@@ -588,17 +694,17 @@ export class Embedding extends Construct {
         }
       ),
       timeout: Duration.minutes(1),
-      environment: {
-        ACCOUNT: Stack.of(this).account,
-        REGION: Stack.of(this).region,
-        BEDROCK_REGION: props.bedrockRegion,
-        CONVERSATION_TABLE_NAME: props.database.conversationTable.tableName,
-        BOT_TABLE_NAME: props.database.botTable.tableName,
-        TABLE_ACCESS_ROLE_ARN: props.database.tableAccessRole.roleArn,
-        DOCUMENT_BUCKET: props.documentBucket.bucketName,
-      },
+      environment: removalEnvironment,
       role: removeHandlerRole,
       logRetention: logs.RetentionDays.THREE_MONTHS,
+      // VPC configuration when private VPC is enabled
+      ...(props.vpc && this.lambdaSecurityGroup
+        ? {
+            vpc: props.vpc,
+            vpcSubnets: { subnetType: SubnetType.PRIVATE_ISOLATED },
+            securityGroups: [this.lambdaSecurityGroup],
+          }
+        : {}),
     });
     this._removalHandler.addEventSource(
       new DynamoEventSource(props.database.botTable, {

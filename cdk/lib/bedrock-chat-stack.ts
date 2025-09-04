@@ -12,6 +12,10 @@ import { Auth } from "./constructs/auth";
 import { Api } from "./constructs/api";
 import { Database } from "./constructs/database";
 import { Frontend } from "./constructs/frontend";
+import { PrivateFrontend } from "./constructs/private-frontend";
+import { PrivateVpc } from "./constructs/private-vpc";
+import { VpcEndpoints } from "./constructs/vpc-endpoints";
+import { PrivateDns } from "./constructs/private-dns";
 import { WebSocket } from "./constructs/websocket";
 import * as cdk from "aws-cdk-lib";
 import { Embedding } from "./constructs/embedding";
@@ -47,11 +51,22 @@ export interface BedrockChatStackProps extends StackProps {
   readonly enableBotStore: boolean;
   readonly enableBotStoreReplicas: boolean;
   readonly botStoreLanguage: Language;
-  readonly globalAvailableModels?: string[];
   readonly tokenValidMinutes: number;
   readonly alternateDomainName?: string;
   readonly hostedZoneId?: string;
   readonly devAccessIamRoleArn?: string;
+  // VPC configuration
+  readonly enablePrivateVpc?: boolean;
+  readonly vpcCidr?: string;
+  readonly existingVpcId?: string;
+  readonly existingPrivateSubnetIds?: string[];
+  // Private DNS configuration
+  readonly privateDomainName?: string;
+  readonly privateHostedZoneId?: string;
+  // Entra ID configuration
+  readonly entraIdTenantId?: string;
+  readonly entraIdClientId?: string;
+  readonly entraIdFederationMetadataUrl?: string;
 }
 
 export class BedrockChatStack extends cdk.Stack {
@@ -72,6 +87,46 @@ export class BedrockChatStack extends cdk.Stack {
       objectOwnership: ObjectOwnership.OBJECT_WRITER,
       autoDeleteObjects: true,
     });
+
+    // Create VPC infrastructure if private VPC is enabled
+    let privateVpc: PrivateVpc | undefined;
+    let vpcEndpoints: VpcEndpoints | undefined;
+    let privateDns: PrivateDns | undefined;
+    
+    // Debug output for private VPC configuration
+    console.log(`[DEBUG] enablePrivateVpc: ${props.enablePrivateVpc}`);
+    console.log(`[DEBUG] enablePrivateVpc type: ${typeof props.enablePrivateVpc}`);
+    console.log(`[DEBUG] enablePrivateVpc === true: ${props.enablePrivateVpc === true}`);
+    
+    // More robust boolean check to handle string "true" values
+    const isPrivateVpcEnabled = props.enablePrivateVpc === true || 
+                               (typeof props.enablePrivateVpc === 'string' && (props.enablePrivateVpc as string).toLowerCase() === 'true');
+    console.log(`[DEBUG] isPrivateVpcEnabled: ${isPrivateVpcEnabled}`);
+    
+    if (isPrivateVpcEnabled) {
+      // Create private VPC infrastructure
+      privateVpc = new PrivateVpc(this, "PrivateVpc", {
+        vpcCidr: props.vpcCidr,
+        existingVpcId: props.existingVpcId,
+        existingPrivateSubnetIds: props.existingPrivateSubnetIds,
+        enableDnsHostnames: true,
+        enableDnsSupport: true,
+      });
+
+      // Create VPC endpoints for AWS services
+      vpcEndpoints = new VpcEndpoints(this, "VpcEndpoints", {
+        vpc: privateVpc.vpc,
+        bedrockRegion: props.bedrockRegion,
+        enablePrivateDns: true,
+      });
+
+      // Create private DNS infrastructure
+      privateDns = new PrivateDns(this, "PrivateDns", {
+        vpc: privateVpc.vpc,
+        domainName: props.privateDomainName || "bedrock-chat.internal",
+        existingHostedZoneId: props.privateHostedZoneId,
+      });
+    }
 
     // Bucket for source code
     const sourceBucket = new Bucket(this, "SourceBucketForCodeBuild", {
@@ -138,22 +193,62 @@ export class BedrockChatStack extends cdk.Stack {
       }
     );
 
-    const frontend = new Frontend(this, "Frontend", {
-      accessLogBucket,
-      webAclId: props.webAclId,
-      enableIpV6: props.enableIpV6,
-      alternateDomainName: props.alternateDomainName,
-      hostedZoneId: props.hostedZoneId,
-    });
+    // Create frontend infrastructure (public or private based on configuration)
+    let frontend: Frontend | undefined;
+    let privateFrontend: PrivateFrontend | undefined;
+    
+    console.log(`[DEBUG] privateVpc exists: ${!!privateVpc}`);
+    console.log(`[DEBUG] privateDns exists: ${!!privateDns}`);
+    console.log(`[DEBUG] Creating private frontend: ${isPrivateVpcEnabled && privateVpc && privateDns}`);
+    
+    if (isPrivateVpcEnabled && privateVpc && privateDns) {
+      console.log(`[DEBUG] Creating PrivateFrontend with domain: ${props.privateDomainName || "bedrock-chat.internal"}`);
+      // Create private frontend with ALB
+      privateFrontend = new PrivateFrontend(this, "PrivateFrontend", {
+        vpc: privateVpc.vpc,
+        privateDomainName: props.privateDomainName || "bedrock-chat.internal",
+        privateHostedZoneId: props.privateHostedZoneId,
+        accessLogBucket,
+      });
 
+      // Update private DNS with ALB reference
+      privateDns = new PrivateDns(this, "PrivateDnsWithALB", {
+        vpc: privateVpc.vpc,
+        domainName: props.privateDomainName || "bedrock-chat.internal",
+        existingHostedZoneId: props.privateHostedZoneId,
+        loadBalancer: privateFrontend.loadBalancer,
+      });
+    } else {
+      // Create public frontend with CloudFront
+      frontend = new Frontend(this, "Frontend", {
+        accessLogBucket,
+        webAclId: props.webAclId,
+        enableIpV6: props.enableIpV6,
+        alternateDomainName: props.alternateDomainName,
+        hostedZoneId: props.hostedZoneId,
+      });
+    }
+
+    // Get the origin URL based on deployment mode
+    const origin = privateFrontend ? privateFrontend.getOrigin() : frontend!.getOrigin();
+    
     const auth = new Auth(this, "Auth", {
-      origin: frontend.getOrigin(),
+      origin,
       userPoolDomainPrefixKey: props.userPoolDomainPrefix,
       idp,
       allowedSignUpEmailDomains: props.allowedSignUpEmailDomains,
       autoJoinUserGroups: props.autoJoinUserGroups,
       selfSignUpEnabled: props.selfSignUpEnabled,
       tokenValidity: Duration.minutes(props.tokenValidMinutes),
+      // Pass VPC configuration for private deployment
+      ...(isPrivateVpcEnabled && privateVpc && vpcEndpoints ? {
+        enablePrivateVpc: true,
+        vpc: privateVpc.vpc,
+        vpcEndpoints: vpcEndpoints,
+        entraIdTenantId: props.entraIdTenantId,
+        entraIdClientId: props.entraIdClientId,
+        entraIdFederationMetadataUrl: props.entraIdFederationMetadataUrl,
+      } : {}),
     });
     const largeMessageBucket = new Bucket(this, "LargeMessageBucket", {
       encryption: BucketEncryption.S3_MANAGED,
@@ -204,7 +299,11 @@ export class BedrockChatStack extends cdk.Stack {
         props.enableBedrockCrossRegionInference,
       enableLambdaSnapStart: props.enableLambdaSnapStart,
       openSearchEndpoint: botStore?.openSearchEndpoint,
-      globalAvailableModels: props.globalAvailableModels,
+      // Pass VPC configuration for private deployment
+      ...(isPrivateVpcEnabled && privateVpc && vpcEndpoints ? {
+        vpc: privateVpc.vpc,
+        vpcEndpointSecurityGroup: vpcEndpoints.endpointSecurityGroup,
+      } : {}),
     });
     props.documentBucket.grantReadWrite(backendApi.handler);
     // Add permissions to API handler for BotStore
@@ -253,27 +352,62 @@ export class BedrockChatStack extends cdk.Stack {
       enableBedrockCrossRegionInference:
         props.enableBedrockCrossRegionInference,
       enableLambdaSnapStart: props.enableLambdaSnapStart,
+      // Pass VPC configuration for private deployment
+      ...(props.enablePrivateVpc === true && privateVpc && vpcEndpoints ? {
+        vpc: privateVpc.vpc,
+        vpcEndpointSecurityGroup: vpcEndpoints.endpointSecurityGroup,
+      } : {}),
     });
-    frontend.buildViteApp({
-      backendApiEndpoint: backendApi.api.apiEndpoint,
-      webSocketApiEndpoint: websocket.apiEndpoint,
-      userPoolDomainPrefix: props.userPoolDomainPrefix,
-      auth,
-      idp,
-    });
+    // Build frontend application based on deployment mode
+    if (privateFrontend) {
+      // Add API Lambda as target to private ALB
+      privateFrontend.addApiTarget(backendApi.handler);
+      
+      // Build Vite app for private deployment
+      privateFrontend.buildViteApp({
+        backendApiEndpoint: privateFrontend.getApiEndpoint(),
+        webSocketApiEndpoint: websocket.apiEndpoint,
+        userPoolDomainPrefix: props.userPoolDomainPrefix,
+        auth,
+        idp,
+      });
+    } else if (frontend) {
+      // Build Vite app for public deployment
+      frontend.buildViteApp({
+        backendApiEndpoint: backendApi.api.apiEndpoint,
+        webSocketApiEndpoint: websocket.apiEndpoint,
+        userPoolDomainPrefix: props.userPoolDomainPrefix,
+        auth,
+        idp,
+      });
+    }
 
-    const cloudFrontWebDistribution = frontend.cloudFrontWebDistribution.node
-      .defaultChild as Distribution;
-    props.documentBucket.addCorsRule({
-      allowedMethods: [HttpMethods.PUT],
-      allowedOrigins: [
-        `https://${cloudFrontWebDistribution.distributionDomainName}`, // frontend.getOrigin() is cyclic reference
-        "http://localhost:5173",
-        "*",
-      ],
-      allowedHeaders: ["*"],
-      maxAge: 3000,
-    });
+    // Configure CORS for document bucket based on deployment mode
+    if (frontend) {
+      const cloudFrontWebDistribution = frontend.cloudFrontWebDistribution.node
+        .defaultChild as Distribution;
+      props.documentBucket.addCorsRule({
+        allowedMethods: [HttpMethods.PUT],
+        allowedOrigins: [
+          `https://${cloudFrontWebDistribution.distributionDomainName}`, // frontend.getOrigin() is cyclic reference
+          "http://localhost:5173",
+          "*",
+        ],
+        allowedHeaders: ["*"],
+        maxAge: 3000,
+      });
+    } else if (privateFrontend) {
+      props.documentBucket.addCorsRule({
+        allowedMethods: [HttpMethods.PUT],
+        allowedOrigins: [
+          privateFrontend.getOrigin(),
+          "http://localhost:5173",
+          "*",
+        ],
+        allowedHeaders: ["*"],
+        maxAge: 3000,
+      });
+    }
 
     const embedding = new Embedding(this, "Embedding", {
       bedrockRegion: props.bedrockRegion,
@@ -281,6 +415,11 @@ export class BedrockChatStack extends cdk.Stack {
       documentBucket: props.documentBucket,
       bedrockCustomBotProject: bedrockCustomBotCodebuild.project,
       enableRagReplicas: props.enableRagReplicas,
+      // Pass VPC configuration for private deployment
+      ...(props.enablePrivateVpc === true && privateVpc && vpcEndpoints ? {
+        vpc: privateVpc.vpc,
+        vpcEndpointSecurityGroup: vpcEndpoints.endpointSecurityGroup,
+      } : {}),
     });
 
     // WebAcl for published API
@@ -297,9 +436,57 @@ export class BedrockChatStack extends cdk.Stack {
     new CfnOutput(this, "DocumentBucketName", {
       value: props.documentBucket.bucketName,
     });
-    new CfnOutput(this, "FrontendURL", {
-      value: frontend.getOrigin(),
-    });
+    
+    // Output frontend URL based on deployment mode
+    console.log(`[DEBUG] privateFrontend exists: ${!!privateFrontend}`);
+    console.log(`[DEBUG] frontend exists: ${!!frontend}`);
+    
+    if (privateFrontend) {
+      console.log(`[DEBUG] Creating private outputs with origin: ${privateFrontend.getOrigin()}`);
+      new CfnOutput(this, "PrivateFrontendURL", {
+        value: privateFrontend.getOrigin(),
+        description: "Private frontend URL for VPC deployment",
+      });
+      new CfnOutput(this, "PrivateApiURL", {
+        value: privateFrontend.getApiEndpoint(),
+        description: "Private API URL for VPC deployment",
+      });
+    } else if (frontend) {
+      console.log(`[DEBUG] Creating public output with origin: ${frontend.getOrigin()}`);
+      new CfnOutput(this, "FrontendURL", {
+        value: frontend.getOrigin(),
+      });
+    }
+
+    // Output VPC information if private VPC is enabled
+    if (props.enablePrivateVpc === true && privateVpc) {
+      new CfnOutput(this, "VpcId", {
+        value: privateVpc.vpc.vpcId,
+        description: "VPC ID for private deployment",
+      });
+      new CfnOutput(this, "PrivateVpcId", {
+        value: privateVpc.vpc.vpcId,
+        description: "Private VPC ID",
+      });
+      
+      if (privateDns) {
+        new CfnOutput(this, "PrivateDomainName", {
+          value: privateDns.domainName,
+          description: "Private domain name for internal service discovery",
+        });
+        new CfnOutput(this, "PrivateHostedZoneId", {
+          value: privateDns.privateHostedZone.hostedZoneId,
+          description: "Private hosted zone ID",
+        });
+      }
+      
+      if (vpcEndpoints) {
+        new CfnOutput(this, "VpcEndpointsSummary", {
+          value: Array.from(vpcEndpoints.interfaceEndpoints.keys()).join(",") || "none",
+          description: "List of created VPC endpoints",
+        });
+      }
+    }
 
     // Outputs for API publication
     new CfnOutput(this, "PublishedApiWebAclArn", {
